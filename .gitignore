@@ -8,3 +8,9 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# ---- 构建产物与安装包（本仓库不分发 APK）----
+*.apk
+*.aab
+*.ap_
+app/build/

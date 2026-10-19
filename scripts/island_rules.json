@@ -1,0 +1,37 @@
+{
+  "version": 3,
+  "events": ["WINDOW_STATE_CHANGED"],
+  "ignore": [
+    "com.android.systemui",
+    "com.miui.home",
+    "com.huawei.android.launcher",
+    "com.android.launcher",
+    "com.oppo.launcher",
+    "com.vivo.launcher",
+    "com.google.android.inputmethod.latin"
+  ],
+  "safety": {
+    "debounceMs": 250,
+    "heartbeatMs": 5000,
+    "onlyWhenScreenOn": true,
+    "noRuleDelayMs": 350,
+    "desktopDelayMs": 800,
+    "hideWhenScreenOff": true
+  },
+  "lifecycle": {
+    "onNoRule": "hide",
+    "manualMuteMin": 10,
+    "hideOnDaemonExit": true,
+    "keepMaxMin": 5
+  },
+  "island": {
+    "default": {
+      "title": "就绪",
+      "content": "未匹配到规则",
+      "short": "空闲"
+    }
+  },
+  "rules": [],
+  "schedules": [],
+  "notifies": []
+}
