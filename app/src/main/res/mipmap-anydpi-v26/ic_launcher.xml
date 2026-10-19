@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 背景：纯白 -->
+    <background android:drawable="@color/ic_launcher_white" />
+    <!-- 前景：像素风熊猫（整图置于中心区域，不再放大或裁切） -->
+    <foreground android:drawable="@drawable/ic_launcher_fg" />
+</adaptive-icon>

@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">上岛验证</string>
+
+    <string name="channel_name">实时更新验证</string>
+    <string name="channel_description">用于验证提升通知（Live Updates）能否上岛</string>
+
+    <!-- 待命态（默认） -->
+    <string name="idle_title">上岛服务待命</string>
+    <string name="idle_text">等待脚本指令</string>
+    <string name="idle_short">待命中</string>
+
+    <string name="btn_start">开始</string>
+    <string name="btn_stop">停止</string>
+    <string name="btn_diagnose">刷新诊断</string>
+    <string name="btn_settings">打开“实时更新”设置</string>
+
+    <string name="log_label">诊断日志：</string>
+</resources>

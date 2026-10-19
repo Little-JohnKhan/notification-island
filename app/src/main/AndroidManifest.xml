@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- ===================================================================
+         一、必须声明的权限
+         =================================================================== -->
+
+    <!-- 提升通知（Live Updates / 上岛）资格。normal 权限：清单声明即可，
+         千万★不要★用 requestPermissions() 去运行时申请它。 -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+
+    <!-- Android 13+ 发通知：运行时权限，需要动态申请 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 前台服务基础权限 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!-- Android 14+ 前台服务类型权限 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <!-- 开机自启 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.LiveUpdateVerify">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- =============================================================
+             前台服务：上岛的硬前提
+             提升通知必须是“这条前台服务自己的通知”，不能是游离通知。
+             ============================================================= -->
+        <service
+            android:name=".LiveUpdateService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="live_update_verification" />
+        </service>
+
+        <!-- =============================================================
+             脚本 → App 的入口（静态注册、exported=true，支持显式广播）
+               com.liveupdate.verify.UPDATE  更新通知
+               com.liveupdate.verify.STOP    停止/下岛
+             同时负责把通知按钮点击转发为 com.liveupdate.verify.FROM_APP
+             ============================================================= -->
+        <receiver
+            android:name=".UpdateReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.liveupdate.verify.UPDATE" />
+                <action android:name="com.liveupdate.verify.STOP" />
+            </intent-filter>
+        </receiver>
+
+        <!-- =============================================================
+             开机自启 / 应用更新后重启服务
+             ============================================================= -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
