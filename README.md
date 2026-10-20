@@ -4,6 +4,19 @@
 
 本项目是完整方案的源码分享：脚本负责「什么时候上岛」，App 负责「真的把通知提升为系统级 Live Update」。
 
+<p align="center">
+  <img src="docs/screenshots/02-notify.jpg" width="45%">
+  <img src="docs/screenshots/04-foreground.jpg" width="45%">
+</p>
+<p align="center">
+  <img src="docs/screenshots/01-config.jpg" width="45%">
+  <img src="docs/screenshots/03-lockscreen.jpg" width="45%">
+</p>
+
+<p align="center">
+  <sub>通知岛（胶囊 + 卡片）· 应用岛（卡片按钮）· 规则配置 · 锁屏展示</sub>
+</p>
+
 ## 为什么需要中转 App
 
 AutoJs6 生成的 `AndroidManifest.xml` 无法声明 `POST_PROMOTED_NOTIFICATIONS` 权限，因此脚本自身发出的通知**永远无法被系统提升**。这是硬性限制，无法绕过。
@@ -38,15 +51,16 @@ AutoJs6 脚本
 │       ├── UpdateReceiver.kt        # 接收脚本广播
 │       ├── BootReceiver.kt          # 开机自启
 │       └── UiLog.kt                 # 界面日志
-└── scripts/                 # AutoJs6 脚本
-    ├── island_kit.js        # 公共工具函数
-    ├── island_daemon.js     # 常驻守护：事件监听 / 双岛栈 / 倒计时
-    ├── island_config.js     # 自绘配置面板
-    ├── island_rules.json    # 规则模板（已清空为通用默认值）
-    ├── 上岛模块.js          # 发广播驱动 App
-    ├── UI模块.js            # 界面依赖
-    ├── UI扩展.js            # 界面依赖
-    └── 使用说明.md          # 脚本侧说明
+├── scripts/                 # AutoJs6 脚本
+│   ├── island_kit.js        # 公共工具函数
+│   ├── island_daemon.js     # 常驻守护：事件监听 / 双岛栈 / 倒计时
+│   ├── island_config.js     # 自绘配置面板
+│   ├── island_rules.json    # 规则模板（已清空为通用默认值）
+│   ├── 上岛模块.js          # 发广播驱动 App
+│   ├── UI模块.js            # 界面依赖
+│   ├── UI扩展.js            # 界面依赖
+│   └── 使用说明.md          # 脚本侧说明
+└── docs/screenshots/        # 效果截图
 ```
 
 ## 环境要求
@@ -66,7 +80,7 @@ AutoJs6 脚本
 ./gradlew assembleDebug
 ```
 
-或使用 GitHub Actions（`.github/workflows/build.yml`），推送到 `main` 自动构建。
+或使用 GitHub Actions（`.github/workflows/build.yml`），推送到 `main` 自动执行编译自检。
 
 固定参数，请勿随意改动：
 
@@ -104,6 +118,19 @@ AutoJs6 脚本
 部署后需要授予 AutoJs6 存储访问权限，并开启无障碍服务与通知使用权。
 
 首次运行请先清空 `island_rules.json` 中的规则，再按自己的使用习惯添加。
+
+### 关于「任务型按钮」
+
+按钮支持两种执行方式：
+
+| 类型 | 行为 | 依赖 |
+|---|---|---|
+| `script` | 直接 `engines.execScriptFile(path)` 运行指定脚本 | 无 |
+| `task` | 写入 `Daily tasks` 的 `RunQueue`，由 `main.js` 调度执行 | **需要 `main.js`** |
+
+`main.js` 是作者个人的任务调度系统，**未包含在本仓库中**。当前代码已做保护：当 `main.js` 不存在时，任务型按钮会直接提示并返回，不会写入无效的队列数据。
+
+如果你没有自己的调度脚本，请把按钮类型设为 `script`。
 
 ## 已知限制
 
