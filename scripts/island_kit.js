@@ -74,7 +74,7 @@ module.exports = (function () {
                 "com.google.android.inputmethod.latin",
             ],
             safety: { debounceMs: 250, heartbeatMs: 5000, onlyWhenScreenOn: true, hideWhenScreenOff: true, noRuleDelayMs: 350, desktopDelayMs: 800 },
-            lifecycle: { onNoRule: "default", manualMuteMin: 10, hideOnDaemonExit: true, keepMaxMin: 5 },
+            lifecycle: { onNoRule: "hide", hideOnDaemonExit: true, keepMaxMin: 5 },
             island: { default: { title: "就绪", content: "未匹配到规则", short: "空闲" } },
             rules: [],
             schedules: [],
@@ -94,8 +94,7 @@ module.exports = (function () {
             c.island    = c.island || {};
             c.events    = (c.events && c.events.length) ? c.events : ["WINDOW_STATE_CHANGED"];
             if (!c.island.default) c.island.default = { title: "就绪", content: "", short: "空闲" };
-            if (!c.lifecycle.onNoRule) c.lifecycle.onNoRule = "default";
-            if (c.lifecycle.manualMuteMin == null) c.lifecycle.manualMuteMin = 10;
+            if (!c.lifecycle.onNoRule) c.lifecycle.onNoRule = "hide";
             if (c.lifecycle.hideOnDaemonExit == null) c.lifecycle.hideOnDaemonExit = true;
             if (c.safety.debounceMs == null) c.safety.debounceMs = 250;
             if (c.safety.heartbeatMs == null) c.safety.heartbeatMs = 5000;

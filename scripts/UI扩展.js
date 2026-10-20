@@ -515,16 +515,30 @@ module.exports = (function () {
     function appPickPanel(o) {
         if (!PANEL) return;
         o = o || {};
-        const apps = listLauncherApps(!!o.includeSystem);
+        let incSys = !!o.includeSystem;
+        let apps = listLauncherApps(incSys);
         const selected = {};
 
         PANEL.open(function (col) {
             panelHeader(col, o.multi ? "选择应用（可多选）" : "选择应用");
 
             const search = et("搜索应用", "", true);
-            const sw = vbox(0);
+
+            // 「含系统应用」开关：默认关，打开后连同 FLAG_SYSTEM 的应用一起列出
+            const sysBtn = tv("含系统应用", 11, T().sub, false);
+            sysBtn.setGravity(G.CENTER);
+            sysBtn.setPadding(dp(10), dp(8), dp(10), dp(8));
+            const paintSysBtn = function () {
+                sysBtn.setTextColor(C(incSys ? (T().dark ? "#04231A" : "#FFFFFF") : T().sub));
+                sysBtn.setBackground(incSys ? UI.roundBg(T().accent, 10) : UI.roundBg(T().card2, 10));
+            };
+            paintSysBtn();
+
+            const sw = hbox();
             sw.setPadding(dp(16), dp(8), dp(16), dp(8));
-            sw.addView(search, new LL.LayoutParams(MATCH, WRAP));
+            sw.addView(search, new LL.LayoutParams(0, WRAP, 1));
+            sw.addView(space(8, 0));
+            sw.addView(sysBtn);
             col.addView(sw);
 
             const box = scrollBox(16);
@@ -601,6 +615,14 @@ module.exports = (function () {
                     box.col.addView(e);
                 }
             }
+
+            sysBtn.setOnClickListener(function () {
+                incSys = !incSys;
+                paintSysBtn();
+                apps = listLauncherApps(incSys);
+                renderList();
+                if (doneBtn) doneBtn.setText("完成 (" + countSel() + ")");
+            });
 
             search.addTextChangedListener(new JavaAdapter(android.text.TextWatcher, {
                 afterTextChanged: function () { renderList(); },

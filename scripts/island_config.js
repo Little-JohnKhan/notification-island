@@ -32,8 +32,8 @@ const EVENT_LIST = [
     { name: "NOTIFICATION_STATE_CHANGED", label: "通知状态变化", hint: "未验证是否可达" },
 ];
 
-const ACT_TYPES = ["none", "task", "script", "code", "app", "page", "hide", "last"];
-const ACT_LABELS = ["未配置", "运行任务（main）", "运行脚本", "执行代码", "打开应用", "打开规则页", "下岛", "切回另一层"];
+const ACT_TYPES = ["none", "task", "script", "code", "app", "page", "hide", "mute", "last"];
+const ACT_LABELS = ["未配置", "运行任务（main）", "运行脚本", "执行代码", "打开应用", "打开规则页", "下岛", "临时屏蔽", "切回另一层"];
 
 /** 按钮图标：App 端内置 ic_action_dog / bear / rabbit / cat，兜底 ic_action_done */
 const ICON_PRESETS = ["（默认）", "dog", "bear", "rabbit", "cat", "手动输入…"];
@@ -413,15 +413,30 @@ function buildBottom() {
 /* ================== 应用选择器 ================== */
 /** 单选应用（搜索 + 首字母圆 + 包名），点一行即返回 */
 function pickAppPanel(onPick) {
-    const apps = kit.listLauncherApps(false);
+    let incSys = false;
+    let apps = kit.listLauncherApps(incSys);
 
     openPanel(function (col) {
         panelHeader(col, "选择应用", null);
 
         const search = kit.et("搜索应用", "", true);
-        const sw = vbox(0);
+
+        // 「含系统应用」开关：默认关，打开后把 FLAG_SYSTEM 的应用也列出来
+        // （短信等系统应用平时不必显示，但抓验证码时需要）
+        const sysBtn = tv("含系统应用", 11, T().sub, false);
+        sysBtn.setGravity(G.CENTER);
+        sysBtn.setPadding(dp(10), dp(8), dp(10), dp(8));
+        const paintSysBtn = function () {
+            sysBtn.setTextColor(C(incSys ? (T().dark ? "#04231A" : "#FFFFFF") : T().sub));
+            sysBtn.setBackground(incSys ? UI.roundBg(T().accent, 10) : UI.roundBg(T().card2, 10));
+        };
+        paintSysBtn();
+
+        const sw = hbox();
         sw.setPadding(dp(16), dp(8), dp(16), dp(8));
-        sw.addView(search, new LL.LayoutParams(MATCH, WRAP));
+        sw.addView(search, new LL.LayoutParams(0, WRAP, 1));
+        sw.addView(space(8, 0));
+        sw.addView(sysBtn);
         col.addView(sw);
 
         const sv = new SV(context);
@@ -476,6 +491,13 @@ function pickAppPanel(onPick) {
             }
         }
 
+        sysBtn.setOnClickListener(function () {
+            incSys = !incSys;
+            paintSysBtn();
+            apps = kit.listLauncherApps(incSys);
+            renderList();
+        });
+
         search.addTextChangedListener(new JavaAdapter(android.text.TextWatcher, {
             afterTextChanged: function () { renderList(); },
             beforeTextChanged: function () {},
@@ -487,16 +509,29 @@ function pickAppPanel(onPick) {
 }
 
 function appPicker() {
-    const apps = kit.listLauncherApps(false);
+    let incSys = false;
+    let apps = kit.listLauncherApps(incSys);
     const selected = {};
 
     openPanel(function (col) {
         panelHeader(col, "选择应用", null);
 
         const search = kit.et("搜索应用", "", true);
-        const sw = vbox(0);
+
+        const sysBtn = tv("含系统应用", 11, T().sub, false);
+        sysBtn.setGravity(G.CENTER);
+        sysBtn.setPadding(dp(10), dp(8), dp(10), dp(8));
+        const paintSysBtn = function () {
+            sysBtn.setTextColor(C(incSys ? (T().dark ? "#04231A" : "#FFFFFF") : T().sub));
+            sysBtn.setBackground(incSys ? UI.roundBg(T().accent, 10) : UI.roundBg(T().card2, 10));
+        };
+        paintSysBtn();
+
+        const sw = hbox();
         sw.setPadding(dp(16), dp(8), dp(16), dp(8));
-        sw.addView(search, new LL.LayoutParams(MATCH, WRAP));
+        sw.addView(search, new LL.LayoutParams(0, WRAP, 1));
+        sw.addView(space(8, 0));
+        sw.addView(sysBtn);
         col.addView(sw);
 
         const sv = new SV(context);
@@ -563,6 +598,14 @@ function appPicker() {
             }
             if (doneBtn) doneBtn.setText("完成 (" + countSel() + ")");
         }
+
+        sysBtn.setOnClickListener(function () {
+            incSys = !incSys;
+            paintSysBtn();
+            apps = kit.listLauncherApps(incSys);
+            renderList();
+            if (doneBtn) doneBtn.setText("完成 (" + countSel() + ")");
+        });
 
         search.addTextChangedListener(new JavaAdapter(android.text.TextWatcher, {
             afterTextChanged: function () { renderList(); },
@@ -682,6 +725,7 @@ function actionText(act) {
     if (act.type === "app") return "应用 · " + (act.name || act.value || "");
     if (act.type === "page") return "打开规则页";
     if (act.type === "hide") return "下岛";
+    if (act.type === "mute") return "临时屏蔽 · " + (act.value || 10) + " 分钟后恢复";
     if (act.type === "last") return "切回另一层";
     return "未配置动作";
 }
@@ -712,20 +756,33 @@ function actionRow(act, onChange) {
                 return;
             }
             if (t === "app") {
-                const apps = kit.listLauncherApps(true);
-                pickList("选择应用", apps.map(function (a) { return a.name; }), 0, function (k) {
-                    act.type = "app"; act.value = apps[k].pkg; act.name = apps[k].name;
-                    label.setText("应用 · " + apps[k].name);
-                    onChange(act);
+                // 用带搜索的选择面板，避免系统应用多时只能手翻
+                kit.appPickPanel({
+                    multi: false,
+                    includeSystem: true,
+                    onPick: function (a) {
+                        act.type = "app"; act.value = a.pkg; act.name = a.name;
+                        label.setText("应用 · " + a.name);
+                        onChange(act);
+                    },
                 });
                 return;
             }
             if (t === "code") {
-                askText("代码片段", act.value || "", function (s) {
+                askText("代码片段（可用 mute(10) 临时屏蔽 / hide() 下岛）", act.value || "", function (s) {
                     act.type = "code"; act.value = s; act.name = "代码";
                     label.setText("代码片段");
                     onChange(act);
                 });
+                return;
+            }
+            if (t === "mute") {
+                askText("临时屏蔽多少分钟后恢复", act.value || "10", function (s) {
+                    const m = Math.max(1, parseInt(s, 10) || 10);
+                    act.type = "mute"; act.value = String(m); act.name = "临时屏蔽";
+                    label.setText("临时屏蔽 · " + m + " 分钟后恢复");
+                    onChange(act);
+                }, true);
                 return;
             }
             filePicker(function (p) {
@@ -761,7 +818,7 @@ function ruleEditor(rule) {
         body.setPadding(dp(16), dp(10), dp(16), dp(16));
 
         const eTitle = kit.et("例如 微信", r.island.title || "");
-        const eContent = kit.et("例如 点击运行微信脚本", r.island.content || "");
+        const eContent = kit.et("例如 点击运行微信脚本（可用 {left} 表示剩余分钟）", r.island.content || "");
         const eShort = kit.et("最多 4 个字", r.island.short || "");
 
         body.addView(tv("岛标题", 12, T().sub));
@@ -871,6 +928,7 @@ function ruleEditor(rule) {
                 if (!lb) {
                     if (b.type === "page") lb = "规则";
                     else if (b.type === "hide") lb = "下岛";
+                    else if (b.type === "mute") lb = "屏蔽" + (b.value || 10) + "分";
                     else if (b.type === "last") lb = "切回";
                     else if (b.value) lb = String(b.name || "执行").substring(0, 4);
                     else b.type = "none";
@@ -989,7 +1047,7 @@ function scheduleEditor(s) {
         body.addView(space(0, 8));
 
         const eTitle = kit.et("例如 该签到了", o.island.title || "");
-        const eContent = kit.et("例如 微信 / 支付宝各有一个签到", o.island.content || "");
+        const eContent = kit.et("例如 该签到了 · 剩余{left}分钟", o.island.content || "");
         const eShort = kit.et("最多 4 个字", o.island.short || "");
 
         body.addView(tv("岛标题", 11, T().sub));
@@ -1098,6 +1156,7 @@ function scheduleEditor(s) {
                 if (!lb) {
                     if (b.type === "page") lb = "规则";
                     else if (b.type === "hide") lb = "下岛";
+                    else if (b.type === "mute") lb = "屏蔽" + (b.value || 10) + "分";
                     else if (b.type === "last") lb = "切回";
                     else if (b.value) lb = String(b.name || "执行").substring(0, 4);
                     else b.type = "none";
@@ -1270,6 +1329,7 @@ function notifyEditor(item) {
                 if (!lb) {
                     if (b.type === "page") lb = "规则";
                     else if (b.type === "hide") lb = "下岛";
+                    else if (b.type === "mute") lb = "屏蔽" + (b.value || 10) + "分";
                     else if (b.type === "last") lb = "切回";
                     else if (b.value) lb = String(b.name || "执行").substring(0, 4);
                     else b.type = "none";
@@ -1456,14 +1516,6 @@ function settingsPanel() {
                 });
             });
 
-        sectionLabel(body, "手动下岛");
-        settingRow(body, "抑制时长", (cfg.lifecycle.manualMuteMin || 10) + " 分钟", function () {
-            askText("下岛后多少分钟内不再自动上岛", (cfg.lifecycle.manualMuteMin || 10), function (s) {
-                cfg.lifecycle.manualMuteMin = Math.max(0, parseInt(s, 10) || 0);
-                saveAll(); closePanel(); settingsPanel();
-            }, true);
-        });
-
         sectionLabel(body, "未命中的抖动过滤");
         settingRow(body, "判定延迟", (cfg.safety.noRuleDelayMs || 0) + " ms", function () {
             const OPTS = [0, 300, 350, 500, 800];
@@ -1496,7 +1548,7 @@ function settingsPanel() {
             });
 
         sectionLabel(body, "默认态（未匹配时展示）");
-        const varHint = tv("标题/内容可用变量：{time} {date} {hour} {min}；自定义变量先用 kit.setVar(\"名\", 值) 写入，再写 {名} 引用", 9, T().sub);
+        const varHint = tv("标题/内容可用变量：{time} {date} {hour} {min}；岛内容里写 {left} 显示定时岛剩余分钟；自定义变量先用 kit.setVar(\"名\", 值) 写入，再写 {名} 引用", 9, T().sub);
         varHint.setPadding(dp(4), dp(0), dp(4), dp(6));
         body.addView(varHint);
         settingRow(body, "标题", cfg.island.default.title || "就绪", function () {

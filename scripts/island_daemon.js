@@ -18,7 +18,19 @@ const kit = require("./island_kit.js");
 const MAX_ACTIONS = 3;
 const TICK_MS = 30000;      // 调度 + 倒计时
 const CMD_MS = 1000;        // 命令轮询（配置页 → 守护）
-const BUILD = "v40 / 2026-10-19 23:12";
+const BUILD = "v45 / 2026-10-20 19:32";
+
+/**
+ * 代码按钮的预置 API。
+ * 代码在独立脚本里执行，拿不到守护的内存状态，
+ * 所以通过 storages 的 cmd 通道与守护通信。
+ * 用户只需写 mute(10) / hide()。
+ */
+const CODE_API = [
+    'var __s = storages.create("island_state");',
+    'function mute(m){ __s.put("cmd", { action: "muteFor", min: Number(m) || 10, at: Date.now() }); }',
+    'function hide(){ __s.put("cmd", { action: "hide", at: Date.now() }); }',
+].join("\n");
 
 /* ================== 运行时状态 ================== */
 let cfg = null;
@@ -32,7 +44,8 @@ let timerEndAt = 0;         // 0 = 一直显示
 let showTimer = false;      // 当前展示的是上层
 let upperKind = "timer";    // 上层来源：timer | notify
 let notifyCtx = { title: "", text: "", app: "" };   // 当前通知的模板变量
-let muteUntil = 0;          // 手动下岛后的抑制截止时间
+let fgMuteUntil = 0;        // 应用层「临时屏蔽」到期时间
+let timerMuteUntil = 0;     // 定时/通知层「临时屏蔽」到期时间
 let lastRun = {};           // interval 类型上次执行时间
 let fired = {};             // 去重：id@yyyy-MM-dd HH:mm
 let lastSig = "";           // 上岛内容签名（避免重复广播）
@@ -45,6 +58,7 @@ let lastReregisterAt = 0;   // 最近一次自愈重注册的时间（带冷却�
 let noRuleTimer = null;     // 未命中规则的延迟判定
 let keepSince = 0;          // 进入「保持不动」的时间
 let islandHidden = false;   // 已撤岛标记（避免重复发 STOP）
+let mutedPkg = "";          // 「下岛」屏蔽的应用：离开该应用前不再为它上岛
 
 /* ================== 配置 ================== */
 function refreshCfg(force) {
@@ -242,7 +256,7 @@ function onAccessibility(name, event) {
         if (hit) {
             fgPkg = pkg;
             fgRule = hit;
-            if (Date.now() < muteUntil) muteUntil = 0;
+            if (mutedPkg) mutedPkg = "";
             render();
             return;
         }
@@ -280,7 +294,7 @@ function probeImeHost() {
             if (!hit) return;
             fgPkg = host;
             fgRule = hit;
-            if (Date.now() < muteUntil) muteUntil = 0;
+            if (mutedPkg) mutedPkg = "";
             render();
         } catch (e) { }
     }, 200);   // 等输入框渲染出来
@@ -334,7 +348,7 @@ function confirmDesktop() {
             if (realRule) {
                 fgPkg = real;
                 fgRule = realRule;
-                if (Date.now() < muteUntil) muteUntil = 0;
+                if (mutedPkg) mutedPkg = "";
                 render();
             } else {
                 commit(real, "");
@@ -359,7 +373,7 @@ function confirmDesktop() {
             refreshCfg();
             fgPkg = p;
             fgRule = findRule(p, c);
-            if (Date.now() < muteUntil) muteUntil = 0;
+            if (mutedPkg) mutedPkg = "";
             render();                       // 卡片页把岛藏了，这里必须重发
             return;
         }
@@ -390,7 +404,7 @@ function commit(pkg, cls) {
 
     fgPkg = pkg;
     fgRule = findRule(pkg, cls);
-    if (Date.now() < muteUntil) muteUntil = 0;  // 前台变了 → 解除抑制
+    if (mutedPkg) mutedPkg = "";  // 前台变了 → 解除抑制
     render();
 }
 
@@ -414,18 +428,46 @@ function isIgnored(pkg) {
 }
 
 /* ================== 双岛：取值 / 渲染 ================== */
+/** 定时/通知层当前是否可用（未被临时屏蔽、且存在） */
+function timerUsable() {
+    return !!timerRule && Date.now() >= timerMuteUntil;
+}
+
+/** 应用层当前是否可用（未被临时屏蔽、未被下岛屏蔽、且存在） */
+function fgUsable() {
+    return !!fgRule && Date.now() >= fgMuteUntil && !(mutedPkg && fgPkg === mutedPkg);
+}
+
 function pickLayer() {
-    if (timerRule && showTimer) return { kind: "timer", rule: timerRule };
-    if (fgRule) return { kind: "fg", rule: fgRule };
-    if (timerRule) return { kind: "timer", rule: timerRule };
+    const timerOk = timerUsable();
+    const fgOk = fgUsable();
+
+    if (timerOk && showTimer) return { kind: "timer", rule: timerRule };
+    if (fgOk) return { kind: "fg", rule: fgRule };
+    if (timerOk) return { kind: "timer", rule: timerRule };
     return null;
 }
 
 function render() {
-    if (Date.now() < muteUntil) return;
+    // 「下岛」屏蔽：只要前台还是被屏蔽的那个应用，就不再为它上岛；
+    // 一旦前台变了（切换到别的应用或回桌面），立即解除。
+    if (mutedPkg && fgPkg !== mutedPkg) mutedPkg = "";
+
     const layer = pickLayer();
-    if (!layer) { noLayer(); return; }
-    const other = layer.kind === "timer" ? fgRule : timerRule;
+    if (!layer) {
+        // 屏蔽期内没有可显示的层时直接撤岛，
+        // 不要退化成「未命中规则」的默认态（否则屏蔽会变成显示"就绪"）
+        if (Date.now() < timerMuteUntil || Date.now() < fgMuteUntil) { hideIsland(); return; }
+        noLayer();
+        return;
+    }
+
+    // 「切回」按钮只在另一层真正可用时出现，
+    // 否则会留着一个点了没反应的死按钮
+    const other = layer.kind === "timer"
+        ? (fgUsable() ? fgRule : null)
+        : (timerUsable() ? timerRule : null);
+
     push(buildPayload(layer.rule, layer.kind, other));
     lastRenderAt = Date.now();
     lastCurrent = {
@@ -482,11 +524,8 @@ function buildPayload(rule, kind, other) {
 
     let text = fillTpl(c.content || (isNotify ? "{title}：{text}" : ""), nctx);
 
-    // 倒计时：展示应用层时，提示上层还剩多久
-    if (kind === "fg" && timerRule && timerEndAt > 0) {
-        const left = leftMinutes();
-        if (left > 0) text = (text ? text + " · " : "") + "「" + displayName(timerRule) + "」还有 " + left + " 分钟";
-    }
+    // 倒计时不再自动附加到正文，改为模板变量 {left}，
+    // 由规则内容自己决定要不要显示、显示成什么样。
 
     return {
         title: fillTpl(c.title || (isNotify ? "{app}" : displayName(rule)), nctx),
@@ -498,8 +537,9 @@ function buildPayload(rule, kind, other) {
 }
 
 /**
- * 变量模板：{app} {title} {text} {time} {date} {hour} {min} {sec}
+ * 变量模板：{app} {title} {text} {time} {date} {hour} {min} {sec} {left}
  * 以及 island_vars 里的自定义变量，例如 {water}。
+ * {left} = 当前上层定时岛的剩余分钟数（无定时岛时为 0）。
  * 未知变量原样保留，方便排查拼写。
  */
 function fillTpl(s, ctx) {
@@ -513,6 +553,7 @@ function fillTpl(s, ctx) {
         hour: String(t.getHours()),
         min: String(t.getMinutes()),
         sec: ("0" + t.getSeconds()).slice(-2),
+        left: String(leftMinutes()),
     };
     var store = null;
     try { store = storages.create("island_vars"); } catch (e) { }
@@ -636,8 +677,8 @@ function tick() {
         fire(s);
     });
 
-    // 倒计时刷新（展示应用层时才有可见变化）
-    if (timerRule && timerEndAt > 0 && !showTimer) render();
+    // 倒计时刷新：{left} 会随时间变化，任何一层都要重绘
+    if (timerRule && timerEndAt > 0) render();
 }
 
 /** 命中返回本次对应的时间点(ms)，否则 null */
@@ -664,21 +705,87 @@ function matchWhen(s, cands) {
 }
 
 function cleanFired(now) {
-    const today = now.getFullYear() + "-" + pad2(now.getMonth() + 1) + "-" + pad2(now.getDate());
+    // key 的实际格式是 id@毫秒时间戳，不含日期字符串。
+    // 旧实现用「key 里是否含 YYYY-MM-DD」判断，永远命中不了，
+    // 结果每次都会把刚写入的 key 也删掉，去重完全失效。
+    // 改为按时间戳清理，保留最近 6 小时。
+    const cutoff = now.getTime() - 6 * 3600 * 1000;
     Object.keys(fired).forEach(function (k) {
-        if (k.indexOf(today) === -1) delete fired[k];
+        const at = Number(String(k).split("@")[1] || 0);
+        if (at && at < cutoff) delete fired[k];
     });
 }
 
-function fire(s) {
+/**
+ * 定时触发。
+ * endAt 可选：补发时传入「原始到期时间」，避免从补发时刻重新计时。
+ */
+function fire(s, endAt) {
     timerRule = s;
     upperKind = "timer";
     showTimer = true;
-    timerEndAt = Number(s.durationMin) > 0 ? Date.now() + Number(s.durationMin) * 60000 : 0;
+    // 新的触发点到来 → 解除这一层的屏蔽（不动应用层）
+    timerMuteUntil = 0;
+    timerEndAt = endAt || (Number(s.durationMin) > 0 ? Date.now() + Number(s.durationMin) * 60000 : 0);
     lastRun[s.id] = Date.now();
     render();
     if (s.autoRun) autoRun(s);
     log("定时上岛: " + (s.name || s.id));
+}
+
+/**
+ * 补发错过的定时触发点。
+ *
+ * 定时任务是 30 秒轮询 + 「当前分钟/前一分钟」命中的机制，
+ * 息屏期间进程被系统冻结时 tick 不会执行，一旦错过就永远不会补，
+ * 表现为「12:00 设了规则，12:10 解锁却什么都没有」。
+ *
+ * 这里在亮屏时回头检查当天已过、但仍在 durationMin 窗口内的触发点，
+ * 用原始到期时间补上，不重新计时。
+ */
+function catchUp() {
+    // 定时层被临时屏蔽时不补发，避免绕过用户的屏蔽意图
+    if (Date.now() < timerMuteUntil) return 0;
+
+    const now = Date.now();
+    const d = new Date(now);
+    let hit = 0;
+
+    (cfg.schedules || []).forEach(function (s) {
+        if (s.enabled === false) return;
+        if (s.autoRun) return;                      // 带自动执行的规则不补，避免事后误跑脚本
+
+        const w = s.when || {};
+        if (w.type === "interval" || w.type === "weekly") return;   // 只补每日固定时间点
+
+        const dur = Number(s.durationMin) || 0;
+        if (dur <= 0) return;                       // 无时长 = 一直显示，没有窗口概念
+
+        const ats = w.at || [];
+        for (let i = 0; i < ats.length; i++) {
+            const p = String(ats[i]).split(":");
+            const hh = Number(p[0]);
+            const mm = Number(p[1]);
+            if (isNaN(hh) || isNaN(mm)) continue;
+
+            const ts = new Date(d.getFullYear(), d.getMonth(), d.getDate(), hh, mm, 0, 0).getTime();
+            if (ts > now) continue;                 // 还没到
+            const endAt = ts + dur * 60000;
+            if (now >= endAt) continue;             // 已过期
+
+            const key = s.id + "@" + ts;
+            if (fired[key]) continue;               // 已经触发过
+
+            fired[key] = now;
+            fire(s, endAt);
+            hit++;
+            log("补发定时岛: " + (s.name || s.id) + "（原定 " + ats[i] + "）");
+            break;
+        }
+    });
+
+    if (hit) cleanFired(d);
+    return hit;
 }
 
 function autoRun(s) {
@@ -738,6 +845,9 @@ island.on("*", function (key) {
 
 function doSwitch() {
     if (!fgRule && !timerRule) return;
+    // 目标层被屏蔽时按钮本不该出现，这里兜底防止「点了没反应」
+    if (showTimer && !fgUsable()) { toast("另一层当前不可用"); return; }
+    if (!showTimer && !timerUsable()) { toast("另一层当前不可用"); return; }
     if (!fgRule) { toast("当前没有应用岛可切"); return; }
     showTimer = !showTimer;
     persist();
@@ -756,8 +866,10 @@ function runAction(b) {
             break;
         case "code":
             if (!b.value) return toast("未配置代码");
-            engines.execScript("island_action.js", b.value);   // 注意：(name, script)
-            setTimeout(function () { refreshCfg(); render(); }, 400);   // 变量可能被改了
+            engines.execScript("island_action.js", CODE_API + "\n" + b.value);   // 注意：(name, script)
+            // 命令轮询是 1 秒一轮，这里等它处理完再重绘，
+            // 否则 mute()/hide() 会先被 400ms 的 render 抢在前面闪一下
+            setTimeout(function () { refreshCfg(); render(); }, 1200);
             break;
         case "app":
             if (!b.value) return toast("未配置包名");
@@ -768,6 +880,9 @@ function runAction(b) {
             break;
         case "hide":
             dismissCurrent();
+            break;
+        case "mute":
+            muteFor(b.value);
             break;
         case "last":
             doSwitch();
@@ -792,8 +907,8 @@ function startNotifyListener() {
 }
 
 function onNotification(n) {
-    if (Date.now() < muteUntil) return;
-
+    // 注意：这里不再因为屏蔽而提前返回。
+    // 来了新的匹配通知就是要放行，并解除定时/通知层的屏蔽。
     const pkg = String(n.getPackageName() || "");
     if (!pkg || isIgnored(pkg)) return;
 
@@ -815,6 +930,8 @@ function onNotification(n) {
     timerRule = rule;
     upperKind = "notify";
     showTimer = true;
+    // 来了新的匹配通知 → 解除这一层的屏蔽
+    timerMuteUntil = 0;
     timerEndAt = Number(rule.durationMin) > 0
         ? Date.now() + Number(rule.durationMin) * 60000
         : 0;
@@ -823,28 +940,52 @@ function onNotification(n) {
     log("通知上岛: " + pkg + " / " + title);
 }
 
-/* ================== 下岛 ================== */
-/** 岛上的「下岛」按钮：定时岛只清定时层，应用岛才整体下岛 */
+/* ================== 下岛 / 临时屏蔽 ================== */
+/**
+ * 下岛：撤掉，本次不再回来。
+ * - 上层是定时岛 / 通知岛：只撤这一层，应用岛自动浮现
+ * - 当前是应用岛：屏蔽到离开这个应用为止（切走或回桌面即解除）
+ */
 function dismissCurrent() {
     if (showTimer && timerRule) {
         timerRule = null;
         timerEndAt = 0;
+        timerMuteUntil = 0;
         showTimer = false;
         render();
         toast("定时岛已下");
-    } else {
-        manualHide();
+        return;
     }
+
+    mutedPkg = fgPkg || "";
+    fgMuteUntil = 0;
+    hideIsland();
+    toast(mutedPkg ? "已下岛，离开该应用后恢复" : "已下岛");
 }
 
-function manualHide() {
-    const min = (cfg.lifecycle && cfg.lifecycle.manualMuteMin) || 10;
-    muteUntil = Date.now() + min * 60000;
-    timerRule = null;
-    timerEndAt = 0;
-    showTimer = false;
-    hideIsland();
-    toast("已下岛，" + min + " 分钟内不再自动上岛");
+/**
+ * 临时屏蔽：只作用于「当前正在看的那一层」，N 分钟后自动恢复。
+ *
+ * - 定时岛/通知岛在上层：屏蔽这一层；应用岛若存在会立刻浮现
+ *   同时顺延 timerEndAt（等于暂停计时），恢复后继续走完剩余时长
+ * - 当前是应用岛：屏蔽应用层，N 分钟后恢复
+ *
+ * 计时独立：屏蔽定时岛不会影响应用岛，反之亦然。
+ */
+function muteFor(min) {
+    const m = Math.max(1, Number(min) || 10);
+    const ms = m * 60000;
+
+    if (showTimer && timerRule) {
+        timerMuteUntil = Date.now() + ms;
+        if (timerEndAt > 0) timerEndAt += ms;   // 暂停计时
+        toast("定时岛已屏蔽 " + m + " 分钟");
+    } else {
+        fgMuteUntil = Date.now() + ms;
+        toast("应用岛已屏蔽 " + m + " 分钟");
+    }
+
+    render();   // 立刻重算该显示哪一层
 }
 
 /* ================== 命令 / 心跳 / 兜底 ================== */
@@ -855,7 +996,8 @@ function startCmdLoop() {
             if (!c || !c.at || c.at <= lastCmdAt) return;
             lastCmdAt = c.at;
             refreshCfg();
-            if (c.action === "hide") manualHide();
+            if (c.action === "hide") dismissCurrent();
+            else if (c.action === "muteFor") muteFor(c.min);
             else if (c.action === "reload") { refreshCfg(true); render(); }
             else if (c.action === "showTimer") { showTimer = true; render(); }
             else if (c.action === "showFg") { showTimer = false; render(); }
@@ -899,6 +1041,7 @@ function startHeartbeat() {
                         if (cfg.safety.hideWhenScreenOff !== false) hideIsland();
                     } else {
                         lastSig = "";      // 强制重发，绕过内容去重
+                        catchUp();         // 息屏期间漏掉的定时触发点，在这里补上
                         render();
                     }
                 }
@@ -927,7 +1070,7 @@ function startHeartbeat() {
                     lastEventAt = Date.now();
                 }
 
-                if (Date.now() < muteUntil) return;
+                if (Date.now() < fgMuteUntil) return;
 
                 // 事件仍在活跃时不做覆盖：currentPackage 可能停留在旧应用（全屏应用尤其明显）
                 const stale = !lastEventAt || (Date.now() - lastEventAt > 60000);
@@ -963,7 +1106,8 @@ function persist() {
         timerEndAt: timerEndAt,
         showTimer: showTimer,
         upperKind: upperKind,
-        muteUntil: muteUntil,
+        fgMuteUntil: fgMuteUntil,
+        timerMuteUntil: timerMuteUntil,
         lastRun: lastRun,
         current: lastCurrent,
         lastEventAt: lastEventAt,
@@ -976,7 +1120,8 @@ function persist() {
 
 function restore() {
     const s = kit.readState();
-    muteUntil = Number(s.muteUntil || 0);
+    fgMuteUntil = Number(s.fgMuteUntil || 0);
+    timerMuteUntil = Number(s.timerMuteUntil || 0);
     lastRun = s.lastRun || {};
     if (s.at) lastCmdAt = Number(s.at);
     upperKind = s.upperKind === "notify" ? "notify" : "timer";
