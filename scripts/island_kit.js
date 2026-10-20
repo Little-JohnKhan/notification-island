@@ -154,6 +154,7 @@ module.exports = (function () {
     function launchTask(name, path, force) {
         if (!path) return false;
         try {
+            if (!new java.io.File(PATHS.main).exists()) { toast("未找到 main.js（任务调度器），请改用脚本型按钮"); return false; }
             const store = storages.create(DAILY_STORE);
             store.put("RunQueue", [{ name: name || "岛任务", path: path }]);
             store.put("RunForce", force !== false);
