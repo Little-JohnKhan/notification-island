@@ -18,7 +18,7 @@ const kit = require("./island_kit.js");
 const MAX_ACTIONS = 3;
 const TICK_MS = 30000;      // 调度 + 倒计时
 const CMD_MS = 1000;        // 命令轮询（配置页 → 守护）
-const BUILD = "v45 / 2026-10-20 19:32";
+const BUILD = "v56 / 2026-10-21 11:20";
 
 /**
  * 代码按钮的预置 API。
@@ -54,6 +54,14 @@ let lastCmdAt = 0;
 let pendingTimer = null;
 let lastEventAt = 0;        // 最近一次收到无障碍事件的时间
 let lastRenderAt = 0;       // 最近一次真正推送岛内容的时间
+let lastForceAt = 0;        // 最近一次「定期重发」的时间
+let appEchoAt = 0;          // 最近一次收到上岛 App 自身通知的时间（当作 ACK）
+let lastSilentLogAt = 0;    // 「事件静默」日志的降频控制
+let lastFixLog = "";        // 「控件树纠正」日志的去重签名
+let lastTreeCheckAt = 0;    // 上次控件树查询时间（自适应降频用）
+let lastTreePkg = null;     // 上次控件树结论；null=从未查过
+let lastBeatAt = 0;         // 上次心跳时间（用于检测进程被冻结）
+const APP_PKG = "com.example.liveupdateverify";   // 上岛中转 App
 let lastReregisterAt = 0;   // 最近一次自愈重注册的时间（带冷却）
 let noRuleTimer = null;     // 未命中规则的延迟判定
 let keepSince = 0;          // 进入「保持不动」的时间
@@ -177,6 +185,13 @@ function detectRealPkg() {
     if (!root) { try { root = auto.root; } catch (e) { } }
     if (!root) return null;
 
+    // 快速路径：根节点包名就是真实应用时，1 次 IPC 即可返回。
+    // 只有「根节点是系统包 / 桌面 / 输入法」时，才需要遍历整棵树找真实应用
+    // —— 那种情况下根节点和子节点的包名才会不一致。
+    var rootPkg = "";
+    try { rootPkg = String(root.packageName() || ""); } catch (e) { }
+    if (rootPkg && !isSystemPkg(rootPkg)) return rootPkg;
+
     var count = {};
     var stack = [root];
     var n = 0;
@@ -260,6 +275,23 @@ function onAccessibility(name, event) {
             render();
             return;
         }
+
+        // 未命中：可能事件包名被系统顶替成了别的应用。
+        // 控件树反查一次——它同时能回答「在哪个应用」和「是否在桌面」，
+        // 这里取「在哪个应用」这个结果，避免误判成离开规则应用而撤岛。
+        const real = detectRealPkg();
+        if (real && real !== pkg) {
+            const realRule = findRule(real, "");
+            if (realRule) {
+                log("事件包名不可信: " + pkg + " → 控件树 " + real);
+                fgPkg = real;
+                fgRule = realRule;
+                if (mutedPkg) mutedPkg = "";
+                render();
+                return;
+            }
+        }
+
         schedule(pkg, cls);
     } catch (e) { log("事件异常: " + e); }
 }
@@ -910,6 +942,11 @@ function onNotification(n) {
     // 注意：这里不再因为屏蔽而提前返回。
     // 来了新的匹配通知就是要放行，并解除定时/通知层的屏蔽。
     const pkg = String(n.getPackageName() || "");
+
+    // 上岛 App 自己重建通知，等于它收到并响应了 UPDATE 广播 —— 当作 ACK 用。
+    // App 被系统杀死后，下一次广播会把它拉起，这里就能重新记到响应时间。
+    if (pkg === APP_PKG) { appEchoAt = Date.now(); return; }
+
     if (!pkg || isIgnored(pkg)) return;
 
     const pool = (cfg.notifies || []).filter(function (r) {
@@ -1021,16 +1058,46 @@ function startHeartbeat() {
         // 兜底：无障碍事件被清空时仍能跟上前台变化
         setInterval(function () {
             try {
+                const tickAt = Date.now();
+
+                // 检测「进程被系统冻结后解冻」：
+                // 冻结期间 setInterval 完全停摆，醒来时这段间隔会异常大。
+                // 此时内存里的 fgPkg 还是冻结前的旧值，必须立即重新同步，
+                // 否则会出现「回桌面不撤岛 / 回了应用岛还停在旧应用」的僵持。
+                if (lastBeatAt && tickAt - lastBeatAt > 90000) {
+                    const slept = Math.round((tickAt - lastBeatAt) / 1000);
+                    log("检测到进程被冻结 " + slept + " 秒，立即重新同步前台");
+                    const real = detectRealPkg();
+                    if (real !== null) {
+                        if (real === "") {
+                            fgPkg = "";
+                            fgRule = null;
+                        } else {
+                            fgPkg = real;
+                            fgRule = findRule(real, "");
+                        }
+                    }
+                    lastSig = "";
+                    catchUp();
+                    render();
+                }
+                lastBeatAt = tickAt;
+
                 refreshCfg();
                 if (new java.io.File(kit.PATHS.dir).exists()) {
                     files.write(kit.PATHS.hb, String(Date.now()));
                 }
 
                 // 自愈：事件回调若被清空（AutoJs6 老问题），这里重新注册
+                // 注意：静置不动时系统本来就不派发 WINDOW_STATE_CHANGED，
+                // 所以「静默」是常态，日志降频到 10 分钟一条，避免刷屏。
                 if (lastEventAt && Date.now() - lastEventAt > 90000) {
-                    log("事件静默超过 90 秒，重新注册无障碍回调");
                     syncEvents();
                     lastEventAt = Date.now();
+                    if (Date.now() - lastSilentLogAt > 10 * 60000) {
+                        lastSilentLogAt = Date.now();
+                        log("事件静默（静置属正常），已重新注册无障碍回调");
+                    }
                 }
 
                 // 息屏 / 亮屏切换：息屏可撤岛，亮屏恢复
@@ -1047,8 +1114,70 @@ function startHeartbeat() {
                 }
                 if (safety.onlyWhenScreenOn && !screenOn) return;
 
+                // 定期重发：Live Update 久不更新会被系统判定不活跃并降级/回收，
+                // 而应用岛在上岛后没有任何状态变化，永远不会自己重发。
+                // 这里兜底刷一次，绕过内容去重（内容没变也要重发）。
+                const FORCE_MS = 5 * 60000;
+                if (Date.now() - lastForceAt > FORCE_MS) {
+                    lastForceAt = Date.now();
+                    if (fgRule || (timerRule && showTimer)) {
+                        const gapMin = appEchoAt ? Math.round((Date.now() - appEchoAt) / 60000) : -1;
+                        lastSig = "";
+                        render();
+                        log("定期重发岛（App 上次响应："
+                            + (gapMin < 0 ? "从未收到" : gapMin + " 分钟前") + "）");
+                    }
+                }
+
                 let cur = "";
                 try { cur = String(currentPackage() || ""); } catch (e) {}
+
+                // 事件静默超过 60 秒后 currentPackage() 不可信：
+                // 系统降级后它会停在旧应用上（实测会卡在 org.autojs.autojs6），
+                // 导致 fgRule 变 null、岛被撤且再也回不来。
+                // 用控件树反查纠正 —— 和 confirmDesktop / 输入法反查是同一套逻辑。
+                const silentNow = !lastEventAt || (Date.now() - lastEventAt > 60000);
+                if (silentNow) {
+                    // 扫描频率自适应：
+                    //   有岛时 5 秒一次（要及时纠正误报，否则会闪/撤）
+                    //   无岛时 30 秒一次（只需发现「静默切进了规则应用」，不必急）
+                    const hasIsland = !!(fgRule || (timerRule && showTimer));
+                    const treeGap = hasIsland ? 5000 : 30000;
+                    if (Date.now() - lastTreeCheckAt < treeGap) {
+                        // 本次跳过扫描，直接沿用上次结论
+                        if (lastTreePkg !== null) cur = lastTreePkg;
+                    } else {
+                        lastTreeCheckAt = Date.now();
+                        const treePkg = detectRealPkg();
+                        if (treePkg === "") {
+                            lastTreePkg = "";
+                            // 控件树里只剩系统包 / 桌面 / 输入法 → 确实在桌面
+                            if (fgPkg || fgRule) {
+                                log("控件树判定在桌面，撤岛（当前记录: " + (fgPkg || "空") + "）");
+                                fgPkg = "";
+                                fgRule = null;
+                                render();
+                            }
+                            return;
+                        }
+                        if (treePkg) {
+                            lastTreePkg = treePkg;
+                            if (treePkg !== cur) {
+                                // 同一对「误报包名 → 真实包名」只记一次，
+                                // 否则输入法长期占着 currentPackage() 时会每 5 秒刷一条
+                                const fixSig = (cur || "空") + "→" + treePkg;
+                                if (fixSig !== lastFixLog) {
+                                    lastFixLog = fixSig;
+                                    log("控件树纠正前台: " + fixSig);
+                                }
+                            } else {
+                                lastFixLog = "";
+                            }
+                            cur = treePkg;
+                        }
+                    }
+                }
+
                 if (!cur || isIgnored(cur)) {
                     // 输入法 / 系统 UI 占位时换一个来源再试
                     try {
@@ -1073,8 +1202,7 @@ function startHeartbeat() {
                 if (Date.now() < fgMuteUntil) return;
 
                 // 事件仍在活跃时不做覆盖：currentPackage 可能停留在旧应用（全屏应用尤其明显）
-                const stale = !lastEventAt || (Date.now() - lastEventAt > 60000);
-                if (fgPkg && fgRule && !stale) return;
+                if (fgPkg && fgRule && !silentNow) return;
                 if (!cur || isIgnored(cur)) return;
                 if (cur === fgPkg && fgRule) return;
 
@@ -1151,24 +1279,39 @@ function restore() {
 (function () {
     let self = null;
     try { self = engines.myEngine(); } catch (e) {}
-    let others = 0;
+
+    // 已有实例是否"僵死"：心跳停止超过 2 分钟，说明那个实例卡住了，
+    // 不能让它挡住新实例，否则 watchdog 永远拉不起来。
+    let lastHb = 0;
+    try { lastHb = parseInt(files.read(kit.PATHS.hb), 10) || 0; } catch (e) {}
+    const stale = !lastHb || Date.now() - lastHb > 120000;
+
+    let others = [];
     try {
         engines.all().forEach(function (e) {
             try {
                 if (self && e.getId && String(e.getId()) === String(self.getId())) return;
-                if (String(e.getSource() || "").indexOf("island_daemon.js") !== -1) others++;
+                if (String(e.getSource() || "").indexOf("island_daemon.js") !== -1) others.push(e);
             } catch (err) {}
         });
     } catch (e) {}
-    if (others > 0) {
-        log("已有 " + others + " 个守护实例在运行，本次启动忽略");
-        toast("守护已在运行，本次启动已忽略");
-        exit();
+
+    if (others.length > 0) {
+        if (!stale) {
+            log("已有 " + others.length + " 个守护实例在运行，本次启动忽略");
+            toast("守护已在运行，本次启动已忽略");
+            exit();
+        }
+        // 心跳早已停止：旧实例多半卡在某个同步调用上，强制终止后由本实例接管
+        others.forEach(function (e) { try { e.forceStop(); } catch (err) {} });
+        log("检测到 " + others.length + " 个僵死实例（心跳停止），已强制终止并接管");
     }
 })();
 
 auto();
 try { new java.io.File(kit.PATHS.dir).mkdirs(); } catch (e) {}
+// 立即打一次心跳：让 watchdog 与本实例的锁判断都能马上看到"我还活着"
+try { files.write(kit.PATHS.hb, String(Date.now())); } catch (e) {}
 refreshCfg(true);
 restore();
 initIntervals();         // restore 之后再补一次，避免 interval 首启丢失基准
