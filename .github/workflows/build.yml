@@ -1,9 +1,9 @@
-name: Build Check
+name: Build APK
 
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
+  workflow_dispatch:          # 网页 Actions 页可手动点按钮触发
 
 jobs:
   build:
@@ -15,22 +15,43 @@ jobs:
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: temurin
           java-version: '17'
+          cache: gradle
 
-      - name: Install Android SDK packages
+      - name: Install Android SDK (36)
         run: |
+          set -e
           SDKM=$(find /usr/local/lib/android -name sdkmanager -type f 2>/dev/null | head -1)
-          echo "sdkmanager: $SDKM"
-          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
-          "$SDKM" "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+          if [ -z "$SDKM" ]; then SDKM=$(command -v sdkmanager || true); fi
+          echo "sdkmanager = [$SDKM]"
+          if [ -z "$SDKM" ]; then echo "sdkmanager not found"; exit 1; fi
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "sdk_root  = [$SDK_ROOT]"
+          # GitHub 默认 shell 带 -o pipefail，yes 被 SIGPIPE 结束返回 141，故 || true
+          yes | "$SDKM" --sdk_root="$SDK_ROOT" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --sdk_root="$SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
 
-      - name: Build debug APK (compile check only)
+      - name: Build debug APK
         run: |
-          chmod +x ./gradlew
-          ./gradlew assembleDebug --no-daemon
+          set -e
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Verify build output
         run: |
           ls -lh app/build/outputs/apk/debug/ || true
-          echo "构建通过。本工作流仅做编译自检，不上传安装包。"
+
+      # 仅手动触发时产出 APK；push 触发只做编译自检，不留任何可下载产物。
+      # retention-days: 1 —— 取完即弃，避免产物长期挂在 Actions 里。
+      - name: Upload APK (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 1

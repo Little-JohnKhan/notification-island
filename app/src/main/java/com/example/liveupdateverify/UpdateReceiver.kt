@@ -10,7 +10,7 @@ import androidx.core.content.ContextCompat
  * 脚本 → App 的入口（Manifest 静态注册，exported=true，支持显式广播）。
  *
  *  - com.liveupdate.verify.UPDATE：★在 onReceive 内完成“重建通知 + 更新通知”★
- *  - com.liveupdate.verify.STOP  ：停止服务、移除通知（下岛）
+ *  - com.liveupdate.verify.STOP  ：降级为静默待命（**不停止服务**）
  *
  * 另外承担 App → 脚本的转发：通知按钮的 PendingIntent 显式指向本 Receiver，
  * 这里再用 sendBroadcast 发出隐式广播 com.liveupdate.verify.FROM_APP 给脚本。
@@ -66,21 +66,26 @@ class UpdateReceiver : BroadcastReceiver() {
         }
     }
 
+    /**
+     * STOP = 下岛但**保活**。
+     *
+     * 旧实现调用 stopAndRemove()（stopForeground + stopSelf），服务结束后
+     * App 变成普通后台应用，被系统冻结后无法再响应 UPDATE，
+     * 表现为「岛彻底不再出现，直到手动点开 App」。
+     *
+     * 现在只把通知换成不申请 promoted 的静默态：岛消失，服务与后台优先级都保留，
+     * 下一条 UPDATE 立刻生效。
+     */
     private fun handleStop(context: Context) {
         val svc = LiveUpdateService.instance
         if (svc != null) {
-            svc.stopAndRemove()
-            UiLog.add("收到广播 STOP，已停止服务（下岛）")
+            svc.demoteToIdle()
+            UiLog.add("收到广播 STOP，已降级为静默待命（服务保留）")
             return
         }
-        try {
-            context.startService(
-                Intent(context, LiveUpdateService::class.java)
-                    .setAction(LiveUpdateService.ACTION_STOP)
-            )
-        } catch (t: Throwable) {
-            Log.w(TAG, "stop 失败（已忽略）: ${t.javaClass.simpleName}")
-        }
+
+        // 服务本来就没在跑 → 没有岛可撤，什么都不用做
+        UiLog.add("收到广播 STOP（服务未运行，已忽略）")
     }
 
     /**
@@ -112,7 +117,7 @@ class UpdateReceiver : BroadcastReceiver() {
         try {
             LiveUpdateService.instance?.refreshNotification()
         } catch (t: Throwable) {
-            Log.w(TAG, "按钮点击后刷新通知失败（已忽略）: ${t.javaClass.simpleName}")
+            Log.w(TAG, "按钮点击后刷新通知失败（已忽略）: ${t.javaClass.simpleName}", t)
         }
     }
 

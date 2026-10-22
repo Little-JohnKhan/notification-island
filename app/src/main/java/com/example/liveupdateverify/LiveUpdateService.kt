@@ -7,19 +7,26 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import androidx.core.app.NotificationCompat
 
 /**
  * 前台服务（上岛的硬前提）。
  *
- * 两种状态，始终是同一条通知、同一个 NOTIF_ID：
- *  - 待命态：上岛服务待命 / 等待脚本指令 / 待命中（无按钮）
+ * 三种状态，始终是同一条通知、同一个 NOTIF_ID：
+ *  - 待命态：上岛服务待命 / 等待脚本指令（会被提升为岛）
  *  - 显示态：广播 com.liveupdate.verify.UPDATE 的 title/text/short（0~3 个按钮）
+ *  - 静默态：STOP 之后的状态 —— **服务保持运行**，通知不申请 promoted，因此不上岛
  *
- * 所有通知都由 NotificationFactory.buildNotification() 构建，本类不直接 new Builder。
+ * 关键改动（相对旧版）：
+ *  STOP 不再 stopSelf()。停掉前台服务会让 App 失去后台优先级，
+ *  被系统冻结后就再也收不到/起不了后续的 UPDATE，表现为「岛彻底不再出现，
+ *  直到手动点开 App」。现在 STOP 只把通知换成静默态，服务常驻。
+ *
+ * 所有「上岛」通知都由 NotificationFactory.buildNotification() 构建，本类不直接 new Builder；
+ * 只有静默态通知由本类自建（刻意不调用 setRequestPromotedOngoing）。
  */
 class LiveUpdateService : Service() {
 
-    // ★ 全类唯一的伴生对象：所有常量、instance、parseExtras 都在这里 ★
     companion object {
         private const val TAG = "LiveUpdateService"
 
@@ -83,7 +90,7 @@ class LiveUpdateService : Service() {
         )
     }
 
-    /** 当前显示内容；null = 待命态 */
+    /** 当前显示内容；null = 待命/静默 */
     @Volatile
     private var current: NotifyData? = null
 
@@ -102,12 +109,12 @@ class LiveUpdateService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                stopAndRemove()
-                return START_NOT_STICKY
+                // ★ 只降级，不停服务
+                demoteToIdle()
             }
 
             ACTION_UPDATE -> {
-                // 服务未运行时被 Receiver 拉起：立刻展示这条通知
+                // 服务被 Receiver 拉起：立刻展示这条通知
                 val data = parseExtras(intent)
                 current = data
                 postNotification(NotificationFactory.buildNotification(this, CHANNEL_ID, data))
@@ -133,10 +140,37 @@ class LiveUpdateService : Service() {
         short = getString(R.string.idle_short)    // 待命中
     )
 
-    /** 待命态（默认）：全部提升条件同样满足，不显示按钮 */
+    /** 待命态（会被提升为岛，用于开机后等待第一条指令） */
     fun showIdle() {
         current = null
         postNotification(NotificationFactory.buildNotification(this, CHANNEL_ID, idleData()))
+    }
+
+    /**
+     * 静默态：收到 STOP 后调用。
+     *
+     * 与前者的区别只有一点：**不申请 promoted**，所以不会出现在状态栏胶囊里，
+     * 但前台服务继续存活，App 保持高优先级，后续 UPDATE 立刻可用。
+     *
+     * 通知栏里会留下一条「待命」提示 —— 这是前台服务的硬性要求，无法隐藏。
+     */
+    fun demoteToIdle() {
+        current = null
+        try {
+            val n = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(applicationInfo.icon)
+                .setContentTitle(getString(R.string.idle_title))
+                .setContentText(getString(R.string.idle_text))
+                .setPriority(NotificationCompat.PRIORITY_MIN)
+                .setOngoing(true)
+                .setSilent(true)
+                .setShowWhen(false)
+                .build()
+            postNotification(n)
+            Log.i(TAG, "已降级为静默待命（服务保留）")
+        } catch (t: Throwable) {
+            Log.e(TAG, "demote 失败（已忽略）: ${t.javaClass.simpleName}", t)
+        }
     }
 
     /** 供 UpdateReceiver 同步内存状态（通知本身由 Receiver 构建并调用 postNotification） */
@@ -144,10 +178,7 @@ class LiveUpdateService : Service() {
         current = data
     }
 
-    /**
-     * 刷新当前通知（待命态则刷新待命态）。
-     * 供“刷新诊断”“按钮点击后刷新”等路径复用，保证永远走同一条构建路径。
-     */
+    /** 刷新当前通知（待命态则刷新待命态） */
     fun refreshNotification() {
         val data = current ?: idleData()
         postNotification(NotificationFactory.buildNotification(this, CHANNEL_ID, data))
@@ -174,7 +205,10 @@ class LiveUpdateService : Service() {
         }
     }
 
-    /** 停止 / 下岛 */
+    /**
+     * 真正停止服务（彻底退出，不再保活）。
+     * 仅用于用户明确要关闭 App 的场景，脚本的 STOP 不再走这里。
+     */
     fun stopAndRemove() {
         try {
             stopForeground(STOP_FOREGROUND_REMOVE)
