@@ -13,17 +13,23 @@ import androidx.core.app.NotificationCompat
  * 前台服务（上岛的硬前提）。
  *
  * 三种状态，始终是同一条通知、同一个 NOTIF_ID：
- *  - 待命态：上岛服务待命 / 等待脚本指令（会被提升为岛）
- *  - 显示态：广播 com.liveupdate.verify.UPDATE 的 title/text/short（0~3 个按钮）
+ *  - 待命态：上岛服务待命 / 等待脚本指令（**不上岛**，只占通知栏）
+ *  - 显示态：广播 com.liveupdate.verify.UPDATE 的 title/text/short（0~3 个按钮，会上岛）
  *  - 静默态：STOP 之后的状态 —— **服务保持运行**，通知不申请 promoted，因此不上岛
  *
- * 关键改动（相对旧版）：
+ * 关键改动一（相对旧版）：
  *  STOP 不再 stopSelf()。停掉前台服务会让 App 失去后台优先级，
  *  被系统冻结后就再也收不到/起不了后续的 UPDATE，表现为「岛彻底不再出现，
  *  直到手动点开 App」。现在 STOP 只把通知换成静默态，服务常驻。
  *
+ * 关键改动二：
+ *  待命态也不再申请 promoted。旧版 onStartCommand 走 showIdle() 时会把
+ *  「待命中」提升成胶囊，于是「打开 App」「进程被系统重启（START_STICKY + intent=null）」
+ *  这两种情况都会在岛上冒出一条 App 原生通知，看起来像脚本失效。
+ *  现在只有真正带着脚本内容（ACTION_UPDATE）的通知才会上岛。
+ *
  * 所有「上岛」通知都由 NotificationFactory.buildNotification() 构建，本类不直接 new Builder；
- * 只有静默态通知由本类自建（刻意不调用 setRequestPromotedOngoing）。
+ * 待命/静默通知由本类自建（刻意不调用 setRequestPromotedOngoing）。
  */
 class LiveUpdateService : Service() {
 
@@ -97,6 +103,50 @@ class LiveUpdateService : Service() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        logExitReasons()
+    }
+
+    /**
+     * 诊断：把系统记录的历史进程退出原因写进日志，用来回答「App 为什么被杀」。
+     *
+     * 只在服务真正新建时打印（进程重启才算一次），所以日志里出现几条，
+     * 就说明进程在本次安装后被启动过几次 —— 每次启动都对应一次「被杀/自启」。
+     * 重点看 reason：2=被信号杀死（LMK 或 ROM 强杀）、14=被冻结、3=低内存。
+     */
+    private fun logExitReasons() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        try {
+            val am = getSystemService(android.app.ActivityManager::class.java) ?: return
+            val list = am.getHistoricalProcessExitReasons(packageName, 0, 5)
+            if (list.isEmpty()) {
+                Log.i(TAG, "进程退出历史：无记录（本次是首次启动）")
+                return
+            }
+            val sdf = java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.getDefault())
+            for (info in list) {
+                val why = when (info.reason) {
+                    1 -> "主动退出"
+                    2 -> "被信号杀死 signal=${info.status}"
+                    3 -> "低内存"
+                    4 -> "Java 崩溃"
+                    5 -> "Native 崩溃"
+                    6 -> "ANR"
+                    7 -> "初始化失败"
+                    8 -> "权限变更"
+                    9 -> "资源占用过高"
+                    10 -> "用户请求"
+                    11 -> "用户强行停止"
+                    12 -> "依赖进程死亡"
+                    14 -> "被冻结 Freezer"
+                    15 -> "包状态变更"
+                    16 -> "App 更新"
+                    else -> "其他(${info.reason})"
+                }
+                Log.i(TAG, "进程退出历史：${sdf.format(java.util.Date(info.timestamp))}  $why")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "读退出历史失败（已忽略）: ${t.javaClass.simpleName}")
+        }
     }
 
     override fun onDestroy() {
@@ -134,42 +184,49 @@ class LiveUpdateService : Service() {
         return START_STICKY
     }
 
-    private fun idleData() = NotifyData(
-        title = getString(R.string.idle_title),   // 上岛服务待命
-        text = getString(R.string.idle_text),     // 等待脚本指令
-        short = getString(R.string.idle_short)    // 待命中
-    )
-
-    /** 待命态（会被提升为岛，用于开机后等待第一条指令） */
+    /**
+     * 待命态：没有任何脚本内容时显示。
+     *
+     * ★ 不申请 promoted，所以不会上岛。旧版这里是会长出原生胶囊的，
+     * 于是「打开 App」「进程被系统重启」都会在岛上冒出一条「待命中」。
+     */
     fun showIdle() {
-        current = null
-        postNotification(NotificationFactory.buildNotification(this, CHANNEL_ID, idleData()))
+        postSilentIdle()
     }
 
     /**
-     * 静默态：收到 STOP 后调用。
-     *
-     * 与前者的区别只有一点：**不申请 promoted**，所以不会出现在状态栏胶囊里，
-     * 但前台服务继续存活，App 保持高优先级，后续 UPDATE 立刻可用。
-     *
-     * 通知栏里会留下一条「待命」提示 —— 这是前台服务的硬性要求，无法隐藏。
+     * 静默态：收到 STOP 后调用，语义上是「脚本主动要求下岛」。
+     * 实现与 [showIdle] 完全相同 —— 都是不带 promoted 的 FGS 占位通知。
      */
     fun demoteToIdle() {
+        postSilentIdle()
+    }
+
+    /**
+     * 待命 / 静默共用：一条不上岛的常驻通知。
+     *
+     * 不上岛的唯一原因是**不调用 setRequestPromotedOngoing / setCriticalText**，
+     * 与渠道、优先级无关（已验证：渠道和 NOTIF_ID 全程不变）。
+     *
+     * 注意：刻意不加 setPriority(PRIORITY_MIN)。Android 8+ 的优先级由渠道决定，
+     * 这两行无效；而且把前台服务通知压到最低，部分 ROM 会把进程判定为低价值，
+     * 反而更容易被清理。
+     */
+    private fun postSilentIdle() {
         current = null
         try {
             val n = NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(applicationInfo.icon)
                 .setContentTitle(getString(R.string.idle_title))
                 .setContentText(getString(R.string.idle_text))
-                .setPriority(NotificationCompat.PRIORITY_MIN)
                 .setOngoing(true)
-                .setSilent(true)
+                .setOnlyAlertOnce(true)
                 .setShowWhen(false)
                 .build()
             postNotification(n)
-            Log.i(TAG, "已降级为静默待命（服务保留）")
+            Log.i(TAG, "进入静默待命（服务保留，不上岛）")
         } catch (t: Throwable) {
-            Log.e(TAG, "demote 失败（已忽略）: ${t.javaClass.simpleName}", t)
+            Log.e(TAG, "写静默待命失败（已忽略）: ${t.javaClass.simpleName}", t)
         }
     }
 
@@ -178,10 +235,11 @@ class LiveUpdateService : Service() {
         current = data
     }
 
-    /** 刷新当前通知（待命态则刷新待命态） */
+    /** 刷新当前通知（无内容时刷新静默占位，不会上岛） */
     fun refreshNotification() {
-        val data = current ?: idleData()
-        postNotification(NotificationFactory.buildNotification(this, CHANNEL_ID, data))
+        val data = current
+        if (data == null) postSilentIdle()
+        else postNotification(NotificationFactory.buildNotification(this, CHANNEL_ID, data))
     }
 
     /**
