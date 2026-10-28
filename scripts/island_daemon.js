@@ -18,7 +18,7 @@ const kit = require("./island_kit.js");
 const MAX_ACTIONS = 3;
 const TICK_MS = 30000;      // 调度 + 倒计时
 const CMD_MS = 1000;        // 命令轮询（配置页 → 守护）
-const BUILD = "v56 / 2026-10-21 11:20";
+const BUILD = "v64 / 2026-10-28 17:45";
 
 /**
  * 代码按钮的预置 API。
@@ -61,12 +61,24 @@ let lastFixLog = "";        // 「控件树纠正」日志的去重签名
 let lastTreeCheckAt = 0;    // 上次控件树查询时间（自适应降频用）
 let lastTreePkg = null;     // 上次控件树结论；null=从未查过
 let lastBeatAt = 0;         // 上次心跳时间（用于检测进程被冻结）
+let lastStallLogAt = 0;     // 「调度停摆」诊断日志的降频控制
 const APP_PKG = "com.example.liveupdateverify";   // 上岛中转 App
 let lastReregisterAt = 0;   // 最近一次自愈重注册的时间（带冷却）
 let noRuleTimer = null;     // 未命中规则的延迟判定
 let keepSince = 0;          // 进入「保持不动」的时间
 let islandHidden = false;   // 已撤岛标记（避免重复发 STOP）
 let mutedPkg = "";          // 「下岛」屏蔽的应用：离开该应用前不再为它上岛
+
+/**
+ * 单实例锁（daemon.lock 存当前持有者的引擎 id）。
+ *
+ * 为什么不用 forceStop 就够：它是协作式中断，只在脚本执行到检查点时才生效。
+ * daemon 全是 setInterval / events 回调，没有主循环，标志可能长时间没人检查，
+ * 于是出现「日志说已强制终止，实际两个实例都在跑」。
+ * 这里改成让旧实例自己读锁、自己 exit() —— 自杀一定生效。
+ */
+const LOCK_PATH = kit.PATHS.dir + "/daemon.lock";
+let MY_ID = "";              // 本实例的引擎 id
 
 /* ================== 配置 ================== */
 function refreshCfg(force) {
@@ -256,14 +268,34 @@ function onAccessibility(name, event) {
             probeImeHost();
             return;
         }
-        if (isIgnored(pkg)) return;     // 系统 UI：保持原状
+        // 上岛 App 自己的界面：既不是规则应用，也不是「离开了应用」。
+        // 按系统浮层处理 —— 保持当前岛不动，并记下时间，
+        // 这样回到原应用时会强制重发一次。否则打开 App 检查会先撤岛，
+        // 回来又可能被 pkg===fgPkg 去重短路，岛就空着不回来了。
+        if (pkg === APP_PKG) {
+            appEchoAt = Date.now();
+            overlaySince = Date.now();
+            return;
+        }
+
+        if (isIgnored(pkg)) {
+            // 系统浮层（截屏 / 内容传送门 / 分享面板）出现时，岛会被浮层遮住。
+            // 记下时间，等回到真正的应用时强制重发一次，否则会一直停在「被藏起来」的状态。
+            overlaySince = Date.now();
+            return;
+        }
 
         lastPkgEventAt = Date.now();
         const backFromRecents = inRecents;
+        const backFromOverlay = overlaySince && (Date.now() - overlaySince < 20000);
+        overlaySince = 0;
         inRecents = false;
 
-        // 从卡片回来时，即使前台包名没变也要重发一次，否则岛一直停在「被系统藏起来」的状态
-        if (pkg === fgPkg && fgRule && !backFromRecents) return;
+        // 从卡片页 / 系统浮层回来时，即使前台包名没变也要重发一次，
+        // 否则岛一直停在「被系统藏起来」的状态。
+        // 注意必须清掉内容签名，否则 push() 会因为「内容没变」而跳过发送。
+        if (backFromOverlay || backFromRecents) lastSig = "";
+        if (pkg === fgPkg && fgRule && !backFromRecents && !backFromOverlay) return;
 
         // 命中规则的应用立即上岛，不等 250ms 复核（复核可能被输入法抢走）
         refreshCfg();
@@ -301,6 +333,7 @@ let lastPkgEventAt = 0;   // 最近一次「非桌面」的窗口事件时间
 let lastEvtPkg = "";
 let lastEvtCls = "";
 let inRecents = false;    // 是否刚从后台卡片页过来（该页会把岛隐藏）
+let overlaySince = 0;     // 系统浮层（截屏/分享面板等）出现的时刻
 
 /* ================== 输入法 → 宿主应用 ================== */
 let imeProbeAt = 0;
@@ -669,7 +702,52 @@ function floorMin(d) { return Math.floor(d.getTime() / 60000) * 60000; }
 function hhmm(d) { return pad2(d.getHours()) + ":" + pad2(d.getMinutes()); }
 function dayOf(d) { return d.getDay() === 0 ? 7 : d.getDay(); }
 
+/* ================== 诊断日志 ==================
+ * 只记录「关键决策点」：调度是否执行、补发为何放弃、触发为何被去重拦下。
+ * 独立文件 diag.log，滚动保留，不影响主日志。
+ * 定位「定时岛到点没上岛」这类问题时，看这个文件即可。
+ */
+const DIAG_PATH = kit.PATHS.dir + "/diag.log";
+const DIAG_MAX = 700;          // 文件行数上限（约一周的日志量）
+const DIAG_KEEP = 500;         // 滚动后保留的行数
+const DIAG_TRIM_EVERY = 200;   // 每 200 条检查一次，避免每次写都读全文
+let diagCount = 0;
+
+function diag(msg) {
+    try {
+        const t = new Date();
+        const line = "[" + pad2(t.getMonth() + 1) + "-" + pad2(t.getDate()) + " "
+            + t.toTimeString().slice(0, 8) + "] " + msg;
+
+        // 周期性滚动：读全文 → 保留最后 DIAG_KEEP 行 → 重写。
+        // 旧实现只在进程启动后的第一条日志时判断一次，之后无限追加，
+        // 结果几天后文件里全是历史噪音（还混着旧版本的记录）。
+        if (++diagCount % DIAG_TRIM_EVERY === 1) {
+            try {
+                const arr = (files.read(DIAG_PATH) || "").split("\n")
+                    .filter(function (x) { return x; });
+                if (arr.length > DIAG_MAX) {
+                    files.write(DIAG_PATH, arr.slice(arr.length - DIAG_KEEP).join("\n") + "\n");
+                }
+            } catch (e) {}
+        }
+        files.append(DIAG_PATH, line + "\n");
+    } catch (e) {}
+}
+
+/**
+ * 详细日志开关。
+ * 默认关闭 —— 「跳过某点（已触发过）」「某点已过期 X 分钟」这类消息
+ * 每次 tick / 每次补发检查都会产生，一天能刷几百条，把真正的异常淹没掉。
+ * 排查「定时岛到点没上岛」时把它改成 true，日志会恢复完整细节。
+ */
+const DIAG_VERBOSE = false;
+function dv(msg) { if (DIAG_VERBOSE) diag(msg); }
+
+let lastTickAt = 0;         // 调度器上次执行时间（用于检测停摆）
+
 function tick() {
+    lastTickAt = Date.now();
     const now = new Date();
     const prev = new Date(now.getTime() - 60000);
     // 两个候选分钟：当前分钟 + 前一分钟（30s tick 可能跨过整分边界，避免漏触发）
@@ -703,9 +781,13 @@ function tick() {
         const hit = matchWhen(s, cands);
         if (!hit) return;
         const key = s.id + "@" + hit;
-        if (fired[key]) return;
+        if (fired[key]) {
+            dv("tick 跳过 " + (s.name || s.id) + "（" + hhmm(new Date(hit)) + " 已触发过）");
+            return;
+        }
         fired[key] = Date.now();
         cleanFired(now);
+        diag("tick 触发 " + (s.name || s.id) + "（" + hhmm(new Date(hit)) + "）");
         fire(s);
     });
 
@@ -724,14 +806,16 @@ function matchWhen(s, cands) {
         return (Date.now() - last >= every) ? cands[0].ts : null;
     }
 
-    for (let i = 0; i < cands.length; i++) {
-        const c = cands[i];
+    // 注意：Rhino 里 for 循环体内的 const/let 不会在每次迭代重新绑定，
+    // 必须一律用 var，否则所有迭代都拿到第一次的值。
+    for (var ci = 0; ci < cands.length; ci++) {
+        var cItem = cands[ci];
         if (w.type === "weekly") {
-            if (String(c.hhmm) !== String(w.at || "")) continue;
-            if ((w.days || []).indexOf(c.day) === -1) continue;
-            return c.ts;
+            if (String(cItem.hhmm) !== String(w.at || "")) continue;
+            if ((w.days || []).indexOf(cItem.day) === -1) continue;
+            return cItem.ts;
         }
-        if ((w.at || []).indexOf(c.hhmm) !== -1) return c.ts;
+        if ((w.at || []).indexOf(cItem.hhmm) !== -1) return cItem.ts;
     }
     return null;
 }
@@ -777,46 +861,79 @@ function fire(s, endAt) {
  */
 function catchUp() {
     // 定时层被临时屏蔽时不补发，避免绕过用户的屏蔽意图
-    if (Date.now() < timerMuteUntil) return 0;
+    if (Date.now() < timerMuteUntil) {
+        diag("补发放弃：定时层屏蔽中，还剩 "
+            + Math.round((timerMuteUntil - Date.now()) / 1000) + " 秒");
+        return 0;
+    }
 
     const now = Date.now();
     const d = new Date(now);
     let hit = 0;
+    const list = cfg.schedules || [];
 
-    (cfg.schedules || []).forEach(function (s) {
-        if (s.enabled === false) return;
-        if (s.autoRun) return;                      // 带自动执行的规则不补，避免事后误跑脚本
+    list.forEach(function (s) {
+        const nm = s.name || s.id;
+        if (s.enabled === false) { dv("  跳过 " + nm + "：已禁用"); return; }
+        if (s.autoRun) { dv("  跳过 " + nm + "：开了「到点执行」，不补"); return; }
 
         const w = s.when || {};
-        if (w.type === "interval" || w.type === "weekly") return;   // 只补每日固定时间点
+        if (w.type === "interval" || w.type === "weekly") {
+            dv("  跳过 " + nm + "：类型 " + w.type + " 不补");
+            return;
+        }
 
         const dur = Number(s.durationMin) || 0;
-        if (dur <= 0) return;                       // 无时长 = 一直显示，没有窗口概念
+        if (dur <= 0) { dv("  跳过 " + nm + "：未设时长（一直显示），不补"); return; }
 
         const ats = w.at || [];
-        for (let i = 0; i < ats.length; i++) {
-            const p = String(ats[i]).split(":");
-            const hh = Number(p[0]);
-            const mm = Number(p[1]);
-            if (isNaN(hh) || isNaN(mm)) continue;
+        let nearestExpired = -1;
 
-            const ts = new Date(d.getFullYear(), d.getMonth(), d.getDate(), hh, mm, 0, 0).getTime();
-            if (ts > now) continue;                 // 还没到
-            const endAt = ts + dur * 60000;
-            if (now >= endAt) continue;             // 已过期
+        // Rhino 陷阱：for 循环体内的 const 不会逐次重新绑定，
+        // 曾经导致所有时间点都算成第一个（08:00），补发永久失效。
+        for (var ai = 0; ai < ats.length; ai++) {
+            var avStr = String(ats[ai]);
+            var avPart = avStr.split(":");
+            var avHh = Number(avPart[0]);
+            var avMm = Number(avPart[1]);
+            if (isNaN(avHh) || isNaN(avMm)) continue;
 
-            const key = s.id + "@" + ts;
-            if (fired[key]) continue;               // 已经触发过
+            var avTs = new Date(d.getFullYear(), d.getMonth(), d.getDate(),
+                                avHh, avMm, 0, 0).getTime();
+            if (avTs > now) continue;                 // 还没到
+            var avEndAt = avTs + dur * 60000;
+            if (now >= avEndAt) {                     // 已过期
+                var avGap = now - avEndAt;
+                if (nearestExpired < 0 || avGap < nearestExpired) nearestExpired = avGap;
+                continue;
+            }
 
-            fired[key] = now;
-            fire(s, endAt);
+            var avKey = s.id + "@" + avTs;
+            if (fired[avKey]) {
+                dv("  跳过 " + nm + " @" + avStr + "：今天这个点已触发过");
+                continue;
+            }
+
+            fired[avKey] = now;
+            fire(s, avEndAt);
             hit++;
-            log("补发定时岛: " + (s.name || s.id) + "（原定 " + ats[i] + "）");
+            log("补发定时岛: " + nm + "（原定 " + avStr + "）");
+            diag("  补发 " + nm + " @" + avStr + "（窗口还剩 "
+                + Math.round((avEndAt - now) / 1000) + " 秒）");
             break;
+        }
+
+        // 过期提示也归到详细日志：每次补发检查都会算一遍，正常情况天天有
+        if (nearestExpired >= 10 * 60000) {
+            dv("  " + nm + " 最近一个时间点已过期 "
+                + Math.round(nearestExpired / 60000) + " 分钟");
         }
     });
 
-    if (hit) cleanFired(d);
+    if (hit) {
+        cleanFired(d);
+        diag("补发定时岛 " + hit + " 条");
+    }
     return hit;
 }
 
@@ -945,7 +1062,23 @@ function onNotification(n) {
 
     // 上岛 App 自己重建通知，等于它收到并响应了 UPDATE 广播 —— 当作 ACK 用。
     // App 被系统杀死后，下一次广播会把它拉起，这里就能重新记到响应时间。
-    if (pkg === APP_PKG) { appEchoAt = Date.now(); return; }
+    if (pkg === APP_PKG) {
+        appEchoAt = Date.now();
+        try {
+            var nt = String(n.getTitle() || "");
+            // App 的通知变成「待命」= 它进入了静默态（进程被重启 / 收到 STOP / 打开了界面），
+            // 岛上的内容已经没了。若 daemon 认为当前应该有岛，就立刻补推一次，
+            // 否则岛会一直空着，只能等下次切换应用或手动点开 App。
+            if (nt.indexOf("待命") !== -1 && !islandHidden && (fgRule || (timerRule && showTimer))) {
+                lastSig = "";
+                setTimeout(function () {
+                    try { render(); } catch (e) { }
+                }, 500);
+                log("App 进入待命态，已补推岛内容");
+            }
+        } catch (e) { }
+        return;
+    }
 
     if (!pkg || isIgnored(pkg)) return;
 
@@ -1058,6 +1191,7 @@ function startHeartbeat() {
         // 兜底：无障碍事件被清空时仍能跟上前台变化
         setInterval(function () {
             try {
+                checkLockOwner();      // 锁被新实例接管 → 自己退出，避免双实例打架
                 const tickAt = Date.now();
 
                 // 检测「进程被系统冻结后解冻」：
@@ -1083,6 +1217,18 @@ function startHeartbeat() {
                 }
                 lastBeatAt = tickAt;
 
+                // 调度停摆检测：tick 每 30 秒一次，超过 90 秒没执行说明被挂起过，
+                // 那段时间内的定时触发点全部会丢，需要靠 catchUp 补。
+                // 降频到每小时一条：休眠时每次唤醒都会命中，一天能刷出上百条
+                if (lastTickAt && tickAt - lastTickAt > 90000
+                    && tickAt - lastStallLogAt > 3600000) {
+                    lastStallLogAt = tickAt;
+                    var onScr = true;
+                    try { onScr = device.isScreenOn(); } catch (e) {}
+                    diag("调度停摆：" + Math.round((tickAt - lastTickAt) / 1000)
+                        + " 秒内 tick 未执行" + (onScr ? "（亮屏，需关注）" : "（休眠中，正常）"));
+                }
+
                 refreshCfg();
                 if (new java.io.File(kit.PATHS.dir).exists()) {
                     files.write(kit.PATHS.hb, String(Date.now()));
@@ -1094,7 +1240,8 @@ function startHeartbeat() {
                 if (lastEventAt && Date.now() - lastEventAt > 90000) {
                     syncEvents();
                     lastEventAt = Date.now();
-                    if (Date.now() - lastSilentLogAt > 10 * 60000) {
+                    // 静置时本来就不派发事件，这条日志纯属噪音，降到每小时最多一条
+                    if (Date.now() - lastSilentLogAt > 3600000) {
                         lastSilentLogAt = Date.now();
                         log("事件静默（静置属正常），已重新注册无障碍回调");
                     }
@@ -1117,15 +1264,20 @@ function startHeartbeat() {
                 // 定期重发：Live Update 久不更新会被系统判定不活跃并降级/回收，
                 // 而应用岛在上岛后没有任何状态变化，永远不会自己重发。
                 // 这里兜底刷一次，绕过内容去重（内容没变也要重发）。
-                const FORCE_MS = 5 * 60000;
+                // 60 秒：App 侧状态丢失（进程重启后通知被重置成待命）时，
+                // 最迟一分钟内能自己恢复，不用手动点开 App。
+                const FORCE_MS = 60000;
                 if (Date.now() - lastForceAt > FORCE_MS) {
                     lastForceAt = Date.now();
                     if (fgRule || (timerRule && showTimer)) {
-                        const gapMin = appEchoAt ? Math.round((Date.now() - appEchoAt) / 60000) : -1;
                         lastSig = "";
                         render();
-                        log("定期重发岛（App 上次响应："
-                            + (gapMin < 0 ? "从未收到" : gapMin + " 分钟前") + "）");
+                        // App 超过 3 分钟没有任何通知事件 → 可能被系统清理过，值得记一笔
+                        if (!appEchoAt || Date.now() - appEchoAt > 3 * 60000) {
+                            const gapMin = appEchoAt ? Math.round((Date.now() - appEchoAt) / 60000) : -1;
+                            log("定期重发岛（App 上次响应："
+                                + (gapMin < 0 ? "从未收到" : gapMin + " 分钟前") + "）");
+                        }
                     }
                 }
 
@@ -1275,16 +1427,14 @@ function restore() {
 }
 
 /* ================== 启动 ================== */
-/* ---- 单实例锁：避免重复点击启动多个守护 ---- */
+/* ---- 单实例锁：启动时抢锁；旧实例靠心跳自查自杀（forceStop 不可靠） ---- */
 (function () {
     let self = null;
     try { self = engines.myEngine(); } catch (e) {}
+    MY_ID = self ? String(self.getId()) : "";
 
-    // 已有实例是否"僵死"：心跳停止超过 2 分钟，说明那个实例卡住了，
-    // 不能让它挡住新实例，否则 watchdog 永远拉不起来。
-    let lastHb = 0;
-    try { lastHb = parseInt(files.read(kit.PATHS.hb), 10) || 0; } catch (e) {}
-    const stale = !lastHb || Date.now() - lastHb > 120000;
+    let owner = "";
+    try { owner = String(files.read(LOCK_PATH) || "").trim(); } catch (e) {}
 
     let others = [];
     try {
@@ -1296,17 +1446,40 @@ function restore() {
         });
     } catch (e) {}
 
+    // 别的实例持锁、且心跳新鲜 → 它是健康的，本次启动直接放弃
+    let lastHb = 0;
+    try { lastHb = parseInt(files.read(kit.PATHS.hb), 10) || 0; } catch (e) {}
+    const hbFresh = !!lastHb && Date.now() - lastHb < 90000;
+    if (others.length > 0 && owner && owner !== MY_ID && hbFresh) {
+        log("守护已在运行（实例 " + owner + "），本次启动忽略");
+        toast("守护已在运行，本次启动已忽略");
+        exit();
+    }
+
+    // 抢锁：写下自己的 id。旧实例下一次心跳会发现锁已易主，自己 exit()。
+    try { files.write(LOCK_PATH, MY_ID); } catch (e) {}
     if (others.length > 0) {
-        if (!stale) {
-            log("已有 " + others.length + " 个守护实例在运行，本次启动忽略");
-            toast("守护已在运行，本次启动已忽略");
-            exit();
-        }
-        // 心跳早已停止：旧实例多半卡在某个同步调用上，强制终止后由本实例接管
         others.forEach(function (e) { try { e.forceStop(); } catch (err) {} });
-        log("检测到 " + others.length + " 个僵死实例（心跳停止），已强制终止并接管");
+        log("接管单实例锁（" + MY_ID + "），已请求终止 " + others.length +
+            " 个旧实例，它们会在下次心跳时自行退出");
     }
 })();
+
+/**
+ * 心跳里自查锁归属。
+ * 被抢了锁就自己退出 —— 不依赖 forceStop 能不能打断。
+ */
+function checkLockOwner() {
+    if (!MY_ID) return;
+    let owner = "";
+    try { owner = String(files.read(LOCK_PATH) || "").trim(); } catch (e) { return; }
+    if (owner && owner !== MY_ID) {
+        log("单实例锁已被实例 " + owner + " 接管，本实例退出（我是 " + MY_ID + "）");
+        // 退出前关掉「退出时撤岛」：新实例正在渲染，这里再撤一次会闪
+        try { if (cfg && cfg.lifecycle) cfg.lifecycle.hideOnDaemonExit = false; } catch (e) {}
+        exit();
+    }
+}
 
 auto();
 try { new java.io.File(kit.PATHS.dir).mkdirs(); } catch (e) {}
@@ -1316,6 +1489,7 @@ refreshCfg(true);
 restore();
 initIntervals();         // restore 之后再补一次，避免 interval 首启丢失基准
 try { storages.create("island_state").put("build", BUILD); } catch (e) {}
+diag("=== 守护启动 " + BUILD + " ===");
 log("守护目录: " + kit.PATHS.dir);
 log("配置文件: " + kit.PATHS.cfg);
 island.start();          // 按钮广播 + 脚本保活
