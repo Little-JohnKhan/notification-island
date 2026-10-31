@@ -69,7 +69,7 @@ AutoJs6 脚本
 | 项 | 要求 |
 |---|---|
 | 系统 | **Android 16（API 36）**，低于此版本无 Live Updates 能力 |
-| 脚本环境 | AutoJs6（最新正式版） |
+| 脚本环境 | [AutoJs6](https://github.com/SuperMonster003/AutoJs6)（最新正式版） |
 | 权限 | 通知使用权、无障碍服务、后台运行白名单、电池优化白名单 |
 | 编译环境 | GitHub Actions，或本地 JDK 17 + Android SDK 36 |
 
@@ -288,6 +288,14 @@ daemon 侧配了单实例锁：启动时把自己的引擎 id 写进 `daemon.loc
 - 本仓库**仅分享源码与技术实现，不提供 APK 安装包**。如需使用请自行编译。
 - 本项目依赖 Android 16 的 Live Updates（promoted ongoing notification）能力，在低版本系统上无实际效果。
 - 代码按「现状」提供，不保证在所有机型上生效。因使用本代码产生的任何后果由使用者自行承担。
+
+## 致谢
+
+- **[AutoJs6](https://github.com/SuperMonster003/AutoJs6)**（MPL-2.0）— 本项目的全部脚本运行在 AutoJs6 上。`currentPackage()`、`auto.rootInActiveWindow`、`events` 等无障碍 API 是整套前台感知方案的基础，`engines` 与「启动时运行 / 定时任务」则支撑了守护的存活与重启逻辑。
+- **[Auto.js](https://github.com/hyb1996/Auto.js)** — AutoJs6 的上游项目，2017 年由 hyb1996 创建，2020 年停止维护后由 SuperMonster003 接手继续开发。
+- **[Termux](https://termux.dev)** — 移动端完成编译、打包与推送的工具链。
+
+本项目与上述项目没有隶属关系，仅作为使用者致谢。
 
 ## License
 
